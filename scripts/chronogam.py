@@ -19,6 +19,20 @@ torch.manual_seed(42)
 np.random.seed(42)
 
 # %%
+
+
+class CovClamping(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        ## Sigmoid * lambda
+        ## Tanh * lambda
+        x_ = torch.where(x < 1e-2, 1e-2, x) # Lower bound
+        x_ = torch.where(x_ > 5, 5, x_) # Upper bound
+        return x_
+
+
 class LeakySineLU(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -99,9 +113,6 @@ class ChronoGAM(pl.LightningModule):
             
         self.use_cosine = use_cosine
         self.use_euclidean = use_euclidean
-        
-        self.den_ = {}
-        self.num_ = {}
 
         # Compreension Network
         self.encoder = nn.Sequential(
@@ -118,15 +129,11 @@ class ChronoGAM(pl.LightningModule):
             ),
             LeakySineLU(),
             GlobalAveragePool(),
-            nn.Linear(in_features=sequence_length, out_features=32, bias=False),
-            LeakySineLU(),
-            nn.Linear(in_features=32, out_features=latent_dim, bias=False)
+            nn.Linear(in_features=sequence_length, out_features=latent_dim, bias=False),
         )
 
         self.decoder = nn.Sequential(
-            nn.Linear(in_features=latent_dim, out_features=32, bias=False),
-            LeakySineLU(),
-            nn.Linear(in_features=32, out_features=sequence_length * 64, bias=False),
+            nn.Linear(in_features=latent_dim, out_features=sequence_length * 64, bias=False),
             LeakySineLU(),
             Upscale(out_channels=64, sequence_length=sequence_length),
             nn.ConvTranspose1d(in_channels=64, out_channels=32, kernel_size=3, padding=3//2, bias=False),
@@ -142,23 +149,25 @@ class ChronoGAM(pl.LightningModule):
         self.estimation = nn.Sequential(
             nn.Linear(in_features=repr_dim, out_features=32),
             nn.LeakyReLU(),
-            nn.Dropout(p=0.5),
+            nn.Dropout(p=0.4),
             nn.Linear(in_features=32, out_features=2),
+            # nn.Softmax(1)
         )
         
-        self.lambda1 = 0.1
+        self.lambda1 = 0.01
         self.lambda2 = 0.005
-        
+
     def configure_optimizers(self) -> Tuple[torch.optim.Optimizer, Any]:
-        optimizer = torch.optim.Adam(self.parameters(), lr=3e-4, weight_decay=1e-5)
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-5)
         scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            optimizer, [400, 405, 408], 0.1
+            optimizer, [200, 215, 230], 0.1
         )
         return [optimizer], [scheduler]
         
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         z_c = self.encoder(x)
-        x_hat = self.decoder(z_c)        
+        x_hat = self.decoder(z_c)      
+        epsilon = 1e-6 
         
         z = torch.cat([
             z_c,
@@ -172,7 +181,7 @@ class ChronoGAM(pl.LightningModule):
             ], dim=1)    
             
         if self.use_euclidean:
-            reconstruction_euclidean = F.pairwise_distance(x, x_hat, p=2)
+            reconstruction_euclidean = (x - x_hat).norm(2, dim=2) / x.norm(2, dim=2) + epsilon
             z = torch.cat([
                 z,
                 reconstruction_euclidean
@@ -190,6 +199,7 @@ class ChronoGAM(pl.LightningModule):
     
     def get_gmm_param(self, gamma: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         N = gamma.shape[0]
+
         ceta = torch.sum(gamma, dim=0) / N
         
         mean = torch.sum(gamma.unsqueeze(-1) * z.unsqueeze(1), dim=0)
@@ -203,7 +213,7 @@ class ChronoGAM(pl.LightningModule):
             ) /
             torch.sum(gamma, dim=0).unsqueeze(-1).unsqueeze(-1)
         )
-        
+
         return ceta, mean, cov
 
     def sample_energy(
@@ -217,8 +227,8 @@ class ChronoGAM(pl.LightningModule):
     ) -> torch.Tensor:
         e = torch.tensor(0.0).to(self.device)
 
-        # Diagonal matrix + 1e-12 (small value on his diagonal)
-        cov_eps = (torch.eye(mean.shape[1]) * (1e-12)).to(self.device)
+        # Diagonal matrix + 1e-6 (small value on his diagonal)
+        cov_eps = (torch.eye(mean.shape[1]) * (1e-6)).to(self.device)
 
         # For each k component
         for k in range(n_gmm):
@@ -228,30 +238,26 @@ class ChronoGAM(pl.LightningModule):
             
             # cov[k] => Covariance matrix of K component
             # TODO: study the alternative of using pinverse
-            inv_cov = torch.linalg.inv(cov[k] + cov_eps).to(self.device)
+            inv_cov = (torch.linalg.inv(cov[k] + cov_eps)).to(self.device)
 
-            e_k = torch.exp(-0.5 * torch.chain_matmul(torch.t(d_k), inv_cov, d_k))
+            # 
+            e_k_ = -0.5 * torch.chain_matmul(torch.t(d_k), inv_cov, d_k)            
+            e_k = torch.where(e_k_ > 0, e_k_ + 1, torch.exp(e_k_))
+            # e_k = torch.exp(e_k_)
+            # print(f'E[k] = {e_k} - Epoch = {self.current_epoch}')
+
             # TODO: maybe remove the torch.abs
 
-            if self.current_epoch in self.den_:
-                self.den_[self.current_epoch].append(e_k.detach().tolist())
-            else:
-                self.den_[self.current_epoch] = []
-                self.den_[self.current_epoch].append(e_k.detach().tolist())
-
             e_k = e_k / torch.sqrt(torch.abs(torch.det(2 * math.pi * cov[k])))
-            
-            if self.current_epoch in self.num_:
-                self.num_[self.current_epoch].append(torch.sqrt(torch.abs(torch.det(2 * math.pi * cov[k]))).detach().tolist())
-            else:
-                self.num_[self.current_epoch] = []
-                self.num_[self.current_epoch].append(torch.sqrt(torch.abs(torch.det(2 * math.pi * cov[k]))).detach().tolist())
 
             e_k = e_k * ceta[k]
 
             e += e_k.squeeze()
+        
+        e = -torch.log(e)
+        e = torch.where(torch.isnan(e), 0, e)
 
-        return -torch.log(e)
+        return e
     
     def calculate_loss(
         self,
@@ -276,10 +282,18 @@ class ChronoGAM(pl.LightningModule):
             e += e_i
             
         p = torch.tensor(0.0).to(self.device)
+        # TODO
+        ##### THIS WAY TO PENALIZE cov_matrix WILL RESULT IN A TOO LARGE LOSS ######
         for k in range(n_gmm):
             cov_k = cov[k]
-            p_k = torch.sum(1 / torch.diagonal(cov_k, 0))
+            p_k = torch.sum(1 / torch.diagonal(cov_k, 0) ** 2)
             p += p_k
+        
+        # for k in range(n_gmm):
+        #     cov_k = cov[k]
+        #     logs = -torch.log(torch.diagonal(cov_k, 0))
+        #     p_k = torch.sum(logs)
+        #     p += p_k
         
         loss = reconstruction_error + (self.lambda1 / z.shape[0]) * e + self.lambda2 * p
         return loss, reconstruction_error, e / z.shape[0], p
@@ -303,7 +317,7 @@ class ChronoGAM(pl.LightningModule):
                     energies[step] = sample_energy.detach().item()
                     step += 1
 
-        threshold = np.percentile(energies, 80)
+        threshold = np.percentile(energies, 85)
         return threshold
     
     def set_threshold(self, dataloader: DataLoader, len_data: int) -> None:
@@ -313,12 +327,12 @@ class ChronoGAM(pl.LightningModule):
         x, _ = batch
         z_c, x_hat, z, gamma = self(x)
         
-        if self.current_epoch <= 400:
-            loss = torch.nn.functional.mse_loss(x_hat, x)
-            self.log('train_loss', loss, prog_bar=True, on_step=False, on_epoch=True)
-            self.log('train_recon_error', loss, prog_bar=True, on_step=False, on_epoch=True)
+        # if self.current_epoch <= 400:
+        #     loss = torch.nn.functional.mse_loss(x_hat, x)
+        #     self.log('train_loss', loss, prog_bar=True, on_step=False, on_epoch=True)
+        #     self.log('train_recon_error', loss, prog_bar=True, on_step=False, on_epoch=True)
 
-            return loss
+        #     return loss
 
         loss, reconstruction_loss, e, p = self.calculate_loss(
             x, x_hat, gamma, z
@@ -327,6 +341,7 @@ class ChronoGAM(pl.LightningModule):
         self.log('train_loss', loss, prog_bar=True, on_step=False, on_epoch=True)
         self.log('train_recon_error', reconstruction_loss, prog_bar=True, on_step=False, on_epoch=True)
         self.log('train_energy', e, prog_bar=True, on_step=False, on_epoch=True)
+        self.log('train_p', p, prog_bar=True, on_step=False, on_epoch=True)
 
         return loss
     
@@ -350,7 +365,7 @@ class ChronoGAM(pl.LightningModule):
             step += 1
 
         accuracy = accuracy_score(scores[:, 0], scores[:, 1])
-        precision, recall, f1, support = precision_recall_fscore_support(scores[:, 0], scores[:, 1], average='weighted')
+        precision, recall, f1, _ = precision_recall_fscore_support(scores[:, 0], scores[:, 1], average='macro')
 
         self.log('accuracy', accuracy, on_epoch=True, on_step=False, prog_bar=True)
         self.log('f1', f1, on_epoch=True, on_step=False, prog_bar=True)
@@ -361,91 +376,91 @@ class ChronoGAM(pl.LightningModule):
 
 # %%
 UCR_DATASETS = [
-    # 'Adiac',
-    # 'ArrowHead',
-    # 'Beef',
-    # 'BeetleFly',
-    # 'BirdChicken',
-    # 'Car',
-    # 'CBF',
-    # 'ChlorineConcentration',
-    # 'CinCECGTorso',
-    # 'Coffee',
-    # 'Computers',
+    'Adiac',
+    'ArrowHead',
+    'Beef',
+    'BeetleFly',
+    'BirdChicken',
+    'Car',
+    'CBF',
+    'ChlorineConcentration',
+    'CinCECGTorso',
+    'Coffee',
+    'Computers',
     'CricketX',
-    # 'CricketY',
-    # 'CricketZ',
-    # 'DiatomSizeReduction',
-    # 'DistalPhalanxOutlineAgeGroup',
-    # 'DistalPhalanxOutlineCorrect',
-    # 'DistalPhalanxTW',
-    # 'Earthquakes',
-    # 'ECG200',
-    # 'ECG5000',
-    # 'ECGFiveDays',
-    # 'ElectricDevices',
-    # 'FaceAll',
-    # 'FaceFour',
-    # 'FacesUCR',
-    # 'FiftyWords',
-    # 'Fish',
-    # 'FordA',
-    # 'FordB',
-    # 'GunPoint',
-    # 'Ham',
-    # 'HandOutlines',
-    # 'Haptics',
-    # 'Herring',
-    # 'InlineSkate',
-    # 'InsectWingbeatSound',
-    # 'ItalyPowerDemand',
-    # 'LargeKitchenAppliances',
-    # 'Lightning2',
-    # 'Lightning7',
-    # 'Mallat',
-    # 'Meat',
-    # 'MedicalImages',
-    # 'MiddlePhalanxOutlineAgeGroup',
-    # 'MiddlePhalanxOutlineCorrect',
-    # 'MiddlePhalanxTW',
-    # 'MoteStrain',
-    # 'NonInvasiveFetalECGThorax1',
-    # 'NonInvasiveFetalECGThorax2',
-    # 'OliveOil',
-    # 'OSULeaf',
-    # 'PhalangesOutlinesCorrect',
-    # 'Phoneme',
-    # 'Plane',
-    # 'ProximalPhalanxOutlineAgeGroup',
-    # 'ProximalPhalanxOutlineCorrect',
-    # 'ProximalPhalanxTW',
-    # 'RefrigerationDevices',
-    # 'ScreenType',
-    # 'ShapeletSim',
-    # 'ShapesAll',
-    # 'SmallKitchenAppliances',
-    # 'SonyAIBORobotSurface1',
-    # 'SonyAIBORobotSurface2',
-    # 'StarLightCurves',
-    # 'Strawberry',
-    # 'SwedishLeaf',
-    # 'Symbols',
-    # 'SyntheticControl',
-    # 'ToeSegmentation1',
-    # 'ToeSegmentation2',
-    # 'Trace',
-    # 'TwoLeadECG',
-    # 'TwoPatterns',
-    # 'UWaveGestureLibraryAll',
-    # 'UWaveGestureLibraryX',
-    # 'UWaveGestureLibraryY',
-    # 'UWaveGestureLibraryZ',
-    # 'Wafer',
-    # 'Wine',
-    # 'WordSynonyms',
-    # 'Worms',
-    # 'WormsTwoClass',
-    # 'Yoga',
+    'CricketY',
+    'CricketZ',
+    'DiatomSizeReduction',
+    'DistalPhalanxOutlineAgeGroup',
+    'DistalPhalanxOutlineCorrect',
+    'DistalPhalanxTW',
+    'Earthquakes',
+    'ECG200',
+    'ECG5000',
+    'ECGFiveDays',
+    'ElectricDevices',
+    'FaceAll',
+    'FaceFour',
+    'FacesUCR',
+    'FiftyWords',
+    'Fish',
+    'FordA',
+    'FordB',
+    'GunPoint',
+    'Ham',
+    'HandOutlines',
+    'Haptics',
+    'Herring',
+    'InlineSkate',
+    'InsectWingbeatSound',
+    'ItalyPowerDemand',
+    'LargeKitchenAppliances',
+    'Lightning2',
+    'Lightning7',
+    'Mallat',
+    'Meat',
+    'MedicalImages',
+    'MiddlePhalanxOutlineAgeGroup',
+    'MiddlePhalanxOutlineCorrect',
+    'MiddlePhalanxTW',
+    'MoteStrain',
+    'NonInvasiveFetalECGThorax1',
+    'NonInvasiveFetalECGThorax2',
+    'OliveOil',
+    'OSULeaf',
+    'PhalangesOutlinesCorrect',
+    'Phoneme',
+    'Plane',
+    'ProximalPhalanxOutlineAgeGroup',
+    'ProximalPhalanxOutlineCorrect',
+    'ProximalPhalanxTW',
+    'RefrigerationDevices',
+    'ScreenType',
+    'ShapeletSim',
+    'ShapesAll',
+    'SmallKitchenAppliances',
+    'SonyAIBORobotSurface1',
+    'SonyAIBORobotSurface2',
+    'StarLightCurves',
+    'Strawberry',
+    'SwedishLeaf',
+    'Symbols',
+    'SyntheticControl',
+    'ToeSegmentation1',
+    'ToeSegmentation2',
+    'Trace',
+    'TwoLeadECG',
+    'TwoPatterns',
+    'UWaveGestureLibraryAll',
+    'UWaveGestureLibraryX',
+    'UWaveGestureLibraryY',
+    'UWaveGestureLibraryZ',
+    'Wafer',
+    'Wine',
+    'WordSynonyms',
+    'Worms',
+    'WormsTwoClass',
+    'Yoga',
     # 'ACSF1',
     # 'BME',
     # 'Chinatown',
@@ -496,9 +511,8 @@ for dataset in UCR_DATASETS:
     x_test, y_test = test_data[:, 1:], test_data[:, 0]
     
     unique_labels = np.unique(y_train)
+
     for label in unique_labels:
-        if label != 3.0:
-            continue
         print(f'\tClassifying the label {label}...')
         # Filter samples from positive label
         x_train_ = x_train[y_train == label]
@@ -528,12 +542,12 @@ for dataset in UCR_DATASETS:
         chrono = ChronoGAM(x_train_.shape[-1], latent_dim=1)
 
         trainer = pl.Trainer(
-            max_epochs=500,
+            max_epochs=300,
             accelerator='gpu',
             devices=-1,
-            default_root_dir=f'./metrics/chrono/{dataset}/{label}/',
-            gradient_clip_val=1.,
-            gradient_clip_algorithm='norm'
+            # default_root_dir=f'./metrics/chrono/{dataset}/{label}/',
+            # gradient_clip_val=1.,
+            # gradient_clip_algorithm='norm'
         )
         trainer.fit(chrono, train_dataloaders=train_loader)
         
@@ -548,15 +562,9 @@ for dataset in UCR_DATASETS:
         results['f1'].append(metrics['f1'])
         results['recall'].append(metrics['recall'])
         results['precision'].append(metrics['precision'])
-        
-        with open("./denominador.txt", "w") as fp:
-            json.dump(chrono.den_, fp)
-            
-        with open("./numerador.txt", "w") as fp:
-            json.dump(chrono.num_, fp)
 
 
-metrics = pd.DataFrame(results)
-metrics.to_csv('./ucr_chrono_3.csv', index=False)
+        metrics = pd.DataFrame(results)
+        metrics.to_csv('./ucr_chrono_old.csv', index=False)
 
 # %%

@@ -32,4 +32,4 @@ final_results['dataset_name'] = results.dataset.str.cat(results.label, sep='-')
 final_results['f1'] = results.f1
 final_results['accuracy'] = results.accuracy
 
-final_results.to_csv('example.csv', index=False)
+final_results.to_csv('all_results.csv', index=False)
