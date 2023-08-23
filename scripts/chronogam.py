@@ -119,27 +119,27 @@ class ChronoGAM(pl.LightningModule):
             nn.Conv1d(
                 in_channels=1, out_channels=16, padding='same', kernel_size=7, bias=False
             ),
-            LeakySineLU(),
+            nn.LeakyReLU(),
             nn.Conv1d(
                 in_channels=16, out_channels=32, padding='same', kernel_size=5, bias=False
             ),
-            LeakySineLU(),
+            nn.LeakyReLU(),
             nn.Conv1d(
                 in_channels=32, out_channels=64, padding='same', kernel_size=3, bias=False
             ),
-            LeakySineLU(),
+            nn.LeakyReLU(),
             GlobalAveragePool(),
             nn.Linear(in_features=sequence_length, out_features=latent_dim, bias=False),
         )
 
         self.decoder = nn.Sequential(
             nn.Linear(in_features=latent_dim, out_features=sequence_length * 64, bias=False),
-            LeakySineLU(),
+            nn.LeakyReLU(),
             Upscale(out_channels=64, sequence_length=sequence_length),
             nn.ConvTranspose1d(in_channels=64, out_channels=32, kernel_size=3, padding=3//2, bias=False),
-            LeakySineLU(),
+            nn.LeakyReLU(),
             nn.ConvTranspose1d(in_channels=32, out_channels=16, kernel_size=5, padding=5//2, bias=False),
-            LeakySineLU(),
+            nn.LeakyReLU(),
             nn.ConvTranspose1d(in_channels=16, out_channels=1, kernel_size=7, padding=7//2, bias=False),
             # LeakySineLU(),
             # nn.ConvTranspose1d(in_channels=1, out_channels=1, kernel_size=1, bias=False), # Optional Layer
@@ -151,23 +151,23 @@ class ChronoGAM(pl.LightningModule):
             nn.LeakyReLU(),
             nn.Dropout(p=0.4),
             nn.Linear(in_features=32, out_features=2),
-            # nn.Softmax(1)
+            nn.Softmax(1)
         )
         
-        self.lambda1 = 0.01
-        self.lambda2 = 0.005
+        self.lambda1 = 0.1
+        self.lambda2 = 0.1
 
     def configure_optimizers(self) -> Tuple[torch.optim.Optimizer, Any]:
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-5)
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
         scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            optimizer, [200, 215, 230], 0.1
+            optimizer, [300, 315, 330], 0.1
         )
         return [optimizer], [scheduler]
         
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         z_c = self.encoder(x)
         x_hat = self.decoder(z_c)      
-        epsilon = 1e-6 
+        epsilon = 1e-12
         
         z = torch.cat([
             z_c,
@@ -242,8 +242,8 @@ class ChronoGAM(pl.LightningModule):
 
             # 
             e_k_ = -0.5 * torch.chain_matmul(torch.t(d_k), inv_cov, d_k)            
-            e_k = torch.where(e_k_ > 0, e_k_ + 1, torch.exp(e_k_))
-            # e_k = torch.exp(e_k_)
+            # e_k = torch.where(e_k_ > 0, e_k_ + 1, torch.exp(e_k_))
+            e_k = torch.exp(e_k_)
             # print(f'E[k] = {e_k} - Epoch = {self.current_epoch}')
 
             # TODO: maybe remove the torch.abs
@@ -255,7 +255,6 @@ class ChronoGAM(pl.LightningModule):
             e += e_k.squeeze()
         
         e = -torch.log(e)
-        e = torch.where(torch.isnan(e), 0, e)
 
         return e
     
@@ -284,16 +283,16 @@ class ChronoGAM(pl.LightningModule):
         p = torch.tensor(0.0).to(self.device)
         # TODO
         ##### THIS WAY TO PENALIZE cov_matrix WILL RESULT IN A TOO LARGE LOSS ######
-        for k in range(n_gmm):
-            cov_k = cov[k]
-            p_k = torch.sum(1 / torch.diagonal(cov_k, 0) ** 2)
-            p += p_k
-        
         # for k in range(n_gmm):
         #     cov_k = cov[k]
-        #     logs = -torch.log(torch.diagonal(cov_k, 0))
-        #     p_k = torch.sum(logs)
+        #     p_k = torch.sum(1 / torch.diagonal(cov_k, 0) ** 2)
         #     p += p_k
+        
+        for k in range(n_gmm):
+            cov_k = cov[k]
+            logs = -torch.log(torch.diagonal(cov_k, 0))
+            p_k = torch.sum(logs)
+            p += p_k
         
         loss = reconstruction_error + (self.lambda1 / z.shape[0]) * e + self.lambda2 * p
         return loss, reconstruction_error, e / z.shape[0], p
@@ -327,12 +326,12 @@ class ChronoGAM(pl.LightningModule):
         x, _ = batch
         z_c, x_hat, z, gamma = self(x)
         
-        # if self.current_epoch <= 400:
-        #     loss = torch.nn.functional.mse_loss(x_hat, x)
-        #     self.log('train_loss', loss, prog_bar=True, on_step=False, on_epoch=True)
-        #     self.log('train_recon_error', loss, prog_bar=True, on_step=False, on_epoch=True)
+        if self.current_epoch <= 400:
+            loss = torch.nn.functional.mse_loss(x_hat, x)
+            self.log('train_loss', loss, prog_bar=True, on_step=False, on_epoch=True)
+            self.log('train_recon_error', loss, prog_bar=True, on_step=False, on_epoch=True)
 
-        #     return loss
+            return loss
 
         loss, reconstruction_loss, e, p = self.calculate_loss(
             x, x_hat, gamma, z
@@ -365,7 +364,7 @@ class ChronoGAM(pl.LightningModule):
             step += 1
 
         accuracy = accuracy_score(scores[:, 0], scores[:, 1])
-        precision, recall, f1, _ = precision_recall_fscore_support(scores[:, 0], scores[:, 1], average='macro')
+        precision, recall, f1, _ = precision_recall_fscore_support(scores[:, 0], scores[:, 1], average='binary')
 
         self.log('accuracy', accuracy, on_epoch=True, on_step=False, prog_bar=True)
         self.log('f1', f1, on_epoch=True, on_step=False, prog_bar=True)
@@ -542,7 +541,7 @@ for dataset in UCR_DATASETS:
         chrono = ChronoGAM(x_train_.shape[-1], latent_dim=1)
 
         trainer = pl.Trainer(
-            max_epochs=300,
+            max_epochs=500,
             accelerator='gpu',
             devices=-1,
             # default_root_dir=f'./metrics/chrono/{dataset}/{label}/',
